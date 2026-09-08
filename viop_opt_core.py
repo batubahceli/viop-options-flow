@@ -28,7 +28,7 @@ import pandas as pd
 # defaults are repo-relative, so a fresh clone runs without editing code.
 DATA_DIR = Path(os.environ.get("VIOP_DATA_DIR", "data"))
 CACHE_DIR = Path(os.environ.get("VIOP_CACHE_DIR", "opt_cache"))
-CACHE_VERSION = 3  # bump to invalidate every cached parquet
+CACHE_VERSION = 4  # v4: contract-size-aware premium calculation
 
 FILE_RE = re.compile(r"^ViopDefter(?P<d>\d{8})\.csv$", re.IGNORECASE)
 CACHE_RE = re.compile(r"^opt_v(?P<v>\d+)_(?P<d>\d{8})\.parquet$", re.IGNORECASE)
@@ -49,22 +49,31 @@ OPT_RE = re.compile(
     r"(?P<date>\d{6}|\d{4})(?P<cp>[CP])(?P<strike>\d+(?:\.\d+)?)$"
 )
 
-# Roots quoted x1000 in the contract code and on the tape:
-# O_USDTRYKE0926C50000 is strike 50.000 against a 49.37 future, and its
-# 257.9 premium is 0.2579. Strike, price and TL all need the same divisor.
+# USDTRYK is quoted x1000 in the contract code and on the tape:
+# O_USDTRYKE0926C50000 is strike 50.000 and a raw FIYAT of 257.9 means
+# an option quote of 0.2579 TRY per USD. Strike and option price therefore
+# need the same divisor. Monetary premium is calculated separately below.
 SCALED_ROOTS = {"USDTRYK": 1000.0}
 
 # Contract-code root -> underlying as people say it.
 ROOT_ALIASES = {"USDTRYK": "USDTRY"}
 
+# VIOP option contract sizes used to convert the quoted option price into
+# cash premium. XU030 is 10 index units, USDTRY is USD 1,000, and single-stock
+# options are 100 shares. All roots other than XU030 / USDTRYK are treated as
+# single-stock options in this dashboard.
+CONTRACT_SIZE_BY_ROOT = {"XU030": 10, "USDTRYK": 1000}
+DEFAULT_CONTRACT_SIZE = 100
+
 RAW_COLS = ["SAAT", "SEMBOL", "FIYAT", "LOT", "TL", "ALAN", "SATAN"]
 
 OUT_COLS = [
     "date", "time", "symbol", "tm", "under", "cp", "strike",
-    "expiry_ym", "expiry_exact", "lot", "price", "tl", "buyer", "seller",
+    "expiry_ym", "expiry_exact", "lot", "price", "contract_size",
+    "premium", "buyer", "seller",
 ]
 
-METRICS = {"lot": "Lots", "tl": "Premium (TL)"}
+METRICS = {"lot": "Lots", "premium": "Premium (TL)"}
 
 
 # ---------------------------------------------------------------- discovery
@@ -250,6 +259,16 @@ def load_uploaded_bytes(name: str, data: bytes) -> pd.DataFrame:
     if kind == "csv_daily":
         return parse_options(read_raw_options_bytes(data), period_start)
 
+    base = Path(name).name
+    version_match = (CACHE_RE.match(base) if kind == "parquet_daily"
+                     else MONTH_CACHE_RE.match(base))
+    version = int(version_match.group("v"))
+    if version != CACHE_VERSION:
+        raise ValueError(
+            f"{base} is cache v{version}, but this app requires v{CACHE_VERSION}. "
+            "Rebuild the cache so Premium (TL) uses the corrected contract sizes."
+        )
+
     frame = pd.read_parquet(io.BytesIO(data))
     missing = [c for c in OUT_COLS if c not in frame.columns]
     if missing:
@@ -295,6 +314,11 @@ def parse_options(raw: pd.DataFrame, trade_date) -> pd.DataFrame:
 
     root = ex["root"].astype(str)
     scale = root.map(SCALED_ROOTS).astype("float64").fillna(1.0)
+    contract_size = (root.map(CONTRACT_SIZE_BY_ROOT)
+                         .fillna(DEFAULT_CONTRACT_SIZE)
+                         .astype("int64"))
+    lot = pd.to_numeric(df["LOT"], errors="coerce")
+    price = pd.to_numeric(df["FIYAT"], errors="coerce") / scale
 
     dt = ex["date"].astype(str)
     is_tm = ex["tm"].notna().to_numpy()
@@ -324,9 +348,12 @@ def parse_options(raw: pd.DataFrame, trade_date) -> pd.DataFrame:
                    .astype("float64") / scale),
         "expiry_ym": pd.Series(ym, index=df.index, dtype="string"),
         "expiry_exact": exact,
-        "lot": pd.to_numeric(df["LOT"], errors="coerce"),
-        "price": pd.to_numeric(df["FIYAT"], errors="coerce") / scale,
-        "tl": pd.to_numeric(df["TL"], errors="coerce") / scale,
+        "lot": lot,
+        "price": price,
+        "contract_size": contract_size,
+        # Cash premium in TRY = quoted option price x contracts x contract size.
+        # Examples per 1 lot: XU030 x10, SSO x100, USDTRY x1000.
+        "premium": price * lot * contract_size,
         "buyer": df["ALAN"].astype("string").str.strip(),
         "seller": df["SATAN"].astype("string").str.strip(),
     })
@@ -484,7 +511,7 @@ def build_monthly_cache(cache_dir: Path | str = CACHE_DIR,
 
 def long_format(df: pd.DataFrame, metric: str = "lot") -> pd.DataFrame:
     """One row per (trade, side): the buyer's leg and the seller's leg."""
-    keep = ["date", "strike", "cp", "symbol", "tm", "price", "lot", "tl"]
+    keep = ["date", "strike", "cp", "symbol", "tm", "price", "lot", "premium"]
     buy = df[keep + ["buyer"]].rename(columns={"buyer": "participant"})
     buy["side"] = "Buy"
     sell = df[keep + ["seller"]].rename(columns={"seller": "participant"})
@@ -577,22 +604,28 @@ def participant_flow(df: pd.DataFrame, metric: str = "lot") -> pd.DataFrame:
             "turnover"]
     if df.empty:
         return pd.DataFrame(columns=cols)
-    b = df.groupby("buyer", observed=True).agg(buy=(metric, "sum"),
-                                               buy_lot=("lot", "sum"),
-                                               buy_tl=("tl", "sum"))
-    s = df.groupby("seller", observed=True).agg(sell=(metric, "sum"),
-                                                sell_lot=("lot", "sum"),
-                                                sell_tl=("tl", "sum"))
+    # VWAP is the quoted option price, not the cash premium per contract.
+    # Keep price*lot explicitly so switching the chart measure to Premium (TL)
+    # does not accidentally multiply the displayed VWAP by contract size.
+    work = df.assign(_price_lot=df["price"] * df["lot"])
+    b = work.groupby("buyer", observed=True).agg(
+        buy=(metric, "sum"), buy_lot=("lot", "sum"),
+        buy_price_lot=("_price_lot", "sum"))
+    s = work.groupby("seller", observed=True).agg(
+        sell=(metric, "sum"), sell_lot=("lot", "sum"),
+        sell_price_lot=("_price_lot", "sum"))
     out = b.join(s, how="outer").fillna(0.0)
     out.index.name = "participant"
     out["net"] = out["buy"] - out["sell"]
     out["turnover"] = out["buy"] + out["sell"]
-    out["buy_vwap"] = np.where(out["buy_lot"] > 0,
-                               out["buy_tl"] / out["buy_lot"].replace(0, np.nan),
-                               np.nan)
-    out["sell_vwap"] = np.where(out["sell_lot"] > 0,
-                                out["sell_tl"] / out["sell_lot"].replace(0, np.nan),
-                                np.nan)
+    out["buy_vwap"] = np.where(
+        out["buy_lot"] > 0,
+        out["buy_price_lot"] / out["buy_lot"].replace(0, np.nan),
+        np.nan)
+    out["sell_vwap"] = np.where(
+        out["sell_lot"] > 0,
+        out["sell_price_lot"] / out["sell_lot"].replace(0, np.nan),
+        np.nan)
     return out.sort_values("turnover", ascending=False).reset_index()
 
 

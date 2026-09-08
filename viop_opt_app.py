@@ -139,14 +139,14 @@ if source_mode == "Upload files":
         "Monthly cache, daily cache, or ViopDefter CSV",
         type=["csv", "parquet"],
         accept_multiple_files=True,
-        help="Best for cloud use: upload opt_v*_YYYYMM.parquet monthly bundles. "
+        help=f"Best for cloud use: upload opt_v{C.CACHE_VERSION}_YYYYMM.parquet monthly bundles. "
              "Daily opt_v*_YYYYMMDD.parquet caches and raw "
              "ViopDefterYYYYMMDD.csv files also work.")
 
     if not uploads:
         st.title("VIOP Options Flow")
         st.info(
-            "Upload one or more monthly `opt_vN_YYYYMM.parquet` files from "
+            f"Upload one or more monthly `opt_v{C.CACHE_VERSION}_YYYYMM.parquet` files from "
             "the sidebar. Daily cache files and raw ViopDefter CSVs are also "
             "accepted. Monthly files are the recommended cloud workflow: one "
             "small upload contains every option trade date in that month.")
@@ -337,7 +337,7 @@ def strike_detail_panel(frame: pd.DataFrame, strike: float, cp: str,
         return
 
     sub = frame[(frame["strike"] == strike) & (frame["cp"] == cp)]
-    vwap = sub["tl"].sum() / sub["lot"].sum()
+    vwap = (sub["price"] * sub["lot"]).sum() / sub["lot"].sum()
     st.markdown(f"#### {title}")
     k = st.columns(4)
     k[0].metric("Lots traded", f"{sub['lot'].sum():,.0f}")
@@ -566,7 +566,7 @@ with tab_mkt:
         top = (df_all.groupby(["under", "expiry_ym", "strike", "cp"],
                               observed=True)
                .agg(lots=("lot", "sum"), trades=("lot", "size"),
-                    premium=("tl", "sum"))
+                    premium=("premium", "sum"))
                .sort_values("lots", ascending=False).head(25).reset_index())
         top["contract"] = (top["under"].astype(str) + " " +
                            top["expiry_ym"].astype(str) + " " +

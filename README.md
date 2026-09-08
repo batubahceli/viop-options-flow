@@ -20,9 +20,12 @@ Two things it is careful about, because both are easy to get wrong:
   four digits silently drops every one of them — in the dataset this was built
   on, that was 30% of all option volume.
 - **`USDTRYK` is quoted ×1000.** `O_USDTRYKE0926C50000` is strike 50.000
-  against a ~49.37 future, and its `257.9` premium is 0.2579. Strike, price and
-  premium all need the same divisor, or FX sits on a different scale from
-  everything else.
+  against a ~49.37 future, and a raw option price of `257.9` is a quote of
+  `0.2579` TRY per USD. Strike and quoted option price use the same divisor.
+- **Premium (TL) uses the VIOP contract multiplier.** Cash premium is
+  `quoted option price × lots × contract size`: XU030 uses `10`, USDTRY uses
+  `1000`, and single-stock options use `100`. VWAP remains the quoted option
+  price and is not multiplied by contract size.
 
 ## Layout
 
@@ -69,12 +72,16 @@ For cloud use, build the option-only caches on your own machine:
 
     python viop_opt_core.py
 
-That command still creates the normal daily cache files, but now also creates
-one upload bundle per calendar month in the same cache directory, for example:
+Cache version 4 includes the corrected contract-size-aware premium formula.
+Older v3 parquet files are intentionally rejected by the browser uploader; rebuild
+them from the raw CSVs once after upgrading.
 
-    opt_v3_202607.parquet
-    opt_v3_202608.parquet
-    opt_v3_202609.parquet
+That command creates the normal daily cache files and one upload bundle per
+calendar month in the same cache directory, for example:
+
+    opt_v4_202607.parquet
+    opt_v4_202608.parquet
+    opt_v4_202609.parquet
 
 Upload the monthly files to the web app instead of selecting 20+ daily files
 for every month. The app reads the actual trade dates inside each monthly file,
