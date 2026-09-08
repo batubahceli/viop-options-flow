@@ -50,8 +50,17 @@ or with a `.streamlit/secrets.toml` (gitignored):
     cache_dir = '\\your-nas\share\opt_cache'
     data_dir  = 'D:\path\to\bistzamansatis'
 
-Both default to `./data` and `./opt_cache` if unset. The folders can also be
-edited live in the sidebar.
+Both default to `./data` and `./opt_cache` if unset. `VIOP_CACHE_DIR` /
+`cache_dir` is the **cache root**: daily parquets live under its `daily/`
+subfolder, while monthly upload bundles live directly in the cache root. The
+folders can also be edited live in the sidebar.
+
+For the current setup:
+
+    raw folder   = D:\vscode\viop_opt_cache
+    cache root   = \\nas2\SHARED\batuhan\opt_cache
+    daily cache  = \\nas2\SHARED\batuhan\opt_cache\daily
+    monthly      = \\nas2\SHARED\batuhan\opt_cache\opt_v4_YYYYMM.parquet
 
 ## Run
 
@@ -76,12 +85,17 @@ Cache version 4 includes the corrected contract-size-aware premium formula.
 Older v3 parquet files are intentionally rejected by the browser uploader; rebuild
 them from the raw CSVs once after upgrading.
 
-That command creates the normal daily cache files and one upload bundle per
-calendar month in the same cache directory, for example:
+That command creates daily cache files under `daily/` and one upload bundle
+per calendar month in the cache root, for example:
 
-    opt_v4_202607.parquet
-    opt_v4_202608.parquet
-    opt_v4_202609.parquet
+    opt_cache/
+        daily/
+            opt_v4_20260901.parquet
+            opt_v4_20260902.parquet
+            ...
+        opt_v4_202607.parquet
+        opt_v4_202608.parquet
+        opt_v4_202609.parquet
 
 Upload the monthly files to the web app instead of selecting 20+ daily files
 for every month. The app reads the actual trade dates inside each monthly file,
@@ -96,9 +110,9 @@ Options are a rounding error of each daily file — roughly 0.3% of rows, a few
 thousand out of 12 million. So the loader filters raw bytes for `;O_` and
 `;TM_O_` before pandas sees anything, then stores the parsed result as one
 parquet per trade date. A 123-day cold build takes about a minute; six months
-of parsed option trades is under 6 MB. After the daily caches are ready, the
-CLI also packs them into monthly parquet bundles for convenient browser upload.
-The daily files remain the canonical local cache.
+of parsed option trades is under 6 MB. After the daily caches are ready, the CLI packs the files from `daily/` into
+monthly parquet bundles in the cache root for convenient browser upload. The
+daily files remain the canonical local cache.
 
 Because loading is **cache-first**, a machine that can reach the cache folder
 needs no raw CSVs at all — put the cache on a share and everyone reads from it:

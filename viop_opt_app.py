@@ -43,7 +43,7 @@ def configured(key: str, fallback) -> str:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def cached_files(data_dir: str, cache_dir: str) -> pd.DataFrame:
-    """What is loadable from local/server-side folders right now."""
+    """What is loadable from raw files or <cache root>/daily right now."""
     return C.available_dates(data_dir, cache_dir)
 
 
@@ -201,7 +201,7 @@ if source_mode == "Upload files":
 
 else:
     cache_dir = st.sidebar.text_input(
-        "Cache folder (shared)", value=configured("cache_dir", C.CACHE_DIR))
+        "Cache root (shared)", value=configured("cache_dir", C.CACHE_DIR))
     data_dir = st.sidebar.text_input(
         "Raw ViopDefter folder", value=configured("data_dir", C.DATA_DIR),
         help="Only needed for dates that are not cached yet. Cached dates "
@@ -211,7 +211,7 @@ else:
     if files.empty:
         st.sidebar.error("Nothing loadable from either folder.")
         st.title("VIOP Options Flow")
-        st.warning(f"No cached parquet in `{cache_dir}` and no "
+        st.warning(f"No daily cached parquet in `{C.daily_cache_dir(cache_dir)}` and no "
                    f"ViopDefterYYYYMMDD.csv in `{data_dir}`.")
         st.markdown(
             "Switch **Source** to **Upload files**, or point this server at "

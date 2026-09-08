@@ -24,10 +24,13 @@ import pandas as pd
 
 # Paths come from the environment so nothing site-specific is baked into the
 # source: point VIOP_DATA_DIR at the folder holding ViopDefterYYYYMMDD.csv and
-# VIOP_CACHE_DIR at the shared parquet cache (a NAS share is fine). Both
-# defaults are repo-relative, so a fresh clone runs without editing code.
+# VIOP_CACHE_DIR at the shared cache ROOT (a NAS share is fine). Daily parquet
+# files live in <cache_root>/daily while monthly upload bundles live directly
+# in <cache_root>. Both defaults are repo-relative, so a fresh clone runs
+# without editing code.
 DATA_DIR = Path(os.environ.get("VIOP_DATA_DIR", "data"))
 CACHE_DIR = Path(os.environ.get("VIOP_CACHE_DIR", "opt_cache"))
+DAILY_CACHE_SUBDIR = "daily"
 CACHE_VERSION = 4  # v4: contract-size-aware premium calculation
 
 FILE_RE = re.compile(r"^ViopDefter(?P<d>\d{8})\.csv$", re.IGNORECASE)
@@ -103,10 +106,15 @@ def discover_files(data_dir: Path | str = DATA_DIR) -> pd.DataFrame:
     return out.sort_values("date").reset_index(drop=True)
 
 
+def daily_cache_dir(cache_dir: Path | str = CACHE_DIR) -> Path:
+    """Canonical folder for per-trade-date parquet caches."""
+    return Path(cache_dir) / DAILY_CACHE_SUBDIR
+
+
 def discover_cache(cache_dir: Path | str = CACHE_DIR) -> pd.DataFrame:
-    """Trade dates already parsed into the cache, for the current version."""
+    """Trade dates in ``<cache_root>/daily`` for the current cache version."""
     rows = []
-    for p in _listdir(cache_dir):
+    for p in _listdir(daily_cache_dir(cache_dir)):
         m = CACHE_RE.match(p.name)
         if m and int(m.group("v")) == CACHE_VERSION:
             rows.append({"date": pd.Timestamp(m.group("d")), "cache": p})
@@ -367,8 +375,9 @@ def parse_options(raw: pd.DataFrame, trade_date) -> pd.DataFrame:
 # -------------------------------------------------------------------- cache
 
 def cache_path(trade_date, cache_dir: Path | str = CACHE_DIR) -> Path:
+    """Path of one daily parquet under ``<cache_root>/daily``."""
     d = pd.Timestamp(trade_date).strftime("%Y%m%d")
-    return Path(cache_dir) / f"opt_v{CACHE_VERSION}_{d}.parquet"
+    return daily_cache_dir(cache_dir) / f"opt_v{CACHE_VERSION}_{d}.parquet"
 
 
 def monthly_cache_path(month, cache_dir: Path | str = CACHE_DIR) -> Path:
@@ -393,7 +402,7 @@ def ensure_cached(trade_date, src: Path | None = None,
         raise FileNotFoundError(
             f"{pd.Timestamp(trade_date).date()} is not in the cache and its "
             f"raw ViopDefter file is not available")
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    dst.parent.mkdir(parents=True, exist_ok=True)
     frame = parse_options(read_raw_options(src), trade_date)
     frame.to_parquet(dst, index=False)
     return dst
@@ -404,8 +413,9 @@ def load_range(start, end, data_dir: Path | str = DATA_DIR,
                force: bool = False, progress=None) -> pd.DataFrame:
     """Every option trade between two trade dates, inclusive.
 
-    Cache-first: a date already in `cache_dir` is read straight from parquet
-    and never needs its raw file, so the app runs off the shared cache alone.
+    Cache-first: a date already in ``<cache_dir>/daily`` is read straight from
+    parquet and never needs its raw file, so the app runs off the shared cache
+    alone. Monthly bundles in ``cache_dir`` are only for browser upload.
     """
     avail = available_dates(data_dir, cache_dir)
     if avail.empty:
@@ -433,7 +443,7 @@ def load_range(start, end, data_dir: Path | str = DATA_DIR,
 def build_cache(data_dir: Path | str = DATA_DIR,
                 cache_dir: Path | str = CACHE_DIR,
                 force: bool = False, log=print) -> pd.DataFrame:
-    """Warm the daily cache for every raw file present."""
+    """Warm ``<cache_root>/daily`` for every raw file present."""
     files = discover_files(data_dir)
     rows = []
     for row in files.itertuples(index=False):
@@ -452,8 +462,9 @@ def build_monthly_cache(cache_dir: Path | str = CACHE_DIR,
                         force: bool = False, log=print) -> pd.DataFrame:
     """Pack daily option caches into one parquet per calendar month.
 
-    Daily caches remain the canonical local cache because they can be updated
-    independently. Monthly bundles are convenience files for browser upload.
+    Daily caches in ``<cache_root>/daily`` remain the canonical local cache
+    because they can be updated independently. Monthly bundles are written
+    directly to ``<cache_root>`` as convenience files for browser upload.
     A monthly file is rebuilt only when it is missing, ``force`` is true, or
     one of its daily caches is newer than the existing bundle.
     """
@@ -724,8 +735,10 @@ def _main(argv=None):
                     help="skip creation of monthly upload bundles")
     a = ap.parse_args(argv)
 
-    print(f"raw   : {a.data_dir}")
-    print(f"cache : {a.cache_dir}")
+    print(f"raw          : {a.data_dir}")
+    print(f"cache root   : {a.cache_dir}")
+    print(f"daily cache  : {daily_cache_dir(a.cache_dir)}")
+    print(f"monthly files: {Path(a.cache_dir)}")
     print("\nDaily cache:")
     done = build_cache(a.data_dir, a.cache_dir, a.force)
     avail = available_dates(a.data_dir, a.cache_dir)
