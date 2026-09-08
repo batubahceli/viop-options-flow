@@ -83,6 +83,17 @@ if files.empty:
     st.title("VIOP Options Flow")
     st.warning(f"No cached parquet in `{cache_dir}` and no "
                f"ViopDefterYYYYMMDD.csv in `{data_dir}`.")
+    st.markdown(
+        "Point it at your data in any one of three ways:\n\n"
+        "1. **Edit either folder in the sidebar** — takes effect immediately.\n"
+        "2. **Create `.streamlit/secrets.toml`** beside the app with "
+        "`cache_dir = '...'` and `data_dir = '...'`.\n"
+        "3. **Set `VIOP_CACHE_DIR` / `VIOP_DATA_DIR`** in the environment.\n\n"
+        "A fresh clone shows the repo-relative defaults `opt_cache` and "
+        "`data`, because `secrets.toml` is gitignored on purpose — real paths "
+        "are never published. If the cache folder is reachable but empty, "
+        "warm it from a machine that has the raw files with "
+        "`python viop_opt_core.py`.")
     st.stop()
 
 n_cached = int(files["cached"].sum())
