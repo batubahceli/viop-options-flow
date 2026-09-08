@@ -1,0 +1,6 @@
+# Pinned to the versions this was built and tested against.
+streamlit==1.61.1
+pandas==3.0.5
+numpy==2.4.6
+plotly==7.0.0
+pyarrow==24.0.0

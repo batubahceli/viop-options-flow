@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# Market data is NEVER committed.
+#
+# These files are member-identified BIST VIOP trade records: they name which
+# member bought and sold what, at which strike. Publishing them is a data
+# licensing question and a market-sensitivity one. The app is built to run
+# against a cache it finds at runtime, so the code travels and the data does
+# not.
+# ---------------------------------------------------------------------------
+data/
+opt_cache/
+temp_data_cache/
+*.csv
+*.parquet
+*.xls
+*.xlsx
+
+# Local configuration: the real NAS share and data folder for this machine.
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+
+# Tooling / editors
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
