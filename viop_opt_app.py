@@ -46,14 +46,23 @@ def configured(key: str, fallback) -> str:
 
 # ------------------------------------------------------------------ loading
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def cached_files(data_dir: str, cache_dir: str) -> pd.DataFrame:
+    """What is loadable right now.
+
+    The TTL matters: this is two directory listings, and without it an empty
+    or unreachable folder gets cached for the life of the process, so a daily
+    drop or a refilled cache could never appear without a restart -- and the
+    page would keep insisting there is no data while the files sit there.
+    """
     return C.available_dates(data_dir, cache_dir)
 
 
 @st.cache_data(show_spinner=False)
 def cached_load(data_dir: str, cache_dir: str, start, end,
-                token: int) -> pd.DataFrame:
+                token: int, fingerprint: tuple = ()) -> pd.DataFrame:
+    """`fingerprint` is part of the cache key, not used in the body: when the
+    set of loadable dates changes, the loaded frame must be recomputed."""
     bar = st.progress(0.0, text="Loading option trades...")
 
     def prog(i, n, d):
@@ -122,7 +131,8 @@ theme = c2.selectbox("Theme", list(V.PALETTES), label_visibility="collapsed")
 P = V.PALETTES[theme]
 
 df_all = cached_load(data_dir, cache_dir, pd.Timestamp(start_d),
-                     pd.Timestamp(end_d), st.session_state["cache_token"])
+                     pd.Timestamp(end_d), st.session_state["cache_token"],
+                     (len(files), n_cached))
 if df_all.empty:
     st.warning("No option trades in the selected range.")
     st.stop()
