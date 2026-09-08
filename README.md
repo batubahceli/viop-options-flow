@@ -54,19 +54,51 @@ edited live in the sidebar.
 
     streamlit run viop_opt_app.py
 
+## Browser upload / Streamlit Cloud
+
+The sidebar now has two data-source modes:
+
+- **Upload files** — works when the app is hosted on Streamlit Cloud. The
+  recommended files are monthly `opt_vN_YYYYMM.parquet` bundles. Daily
+  `opt_vN_YYYYMMDD.parquet` caches and raw `ViopDefterYYYYMMDD.csv` files are
+  also accepted.
+- **Local folders** — keeps the original behaviour for a local or internally
+  hosted Streamlit process that can reach the configured folders.
+
+For cloud use, build the option-only caches on your own machine:
+
+    python viop_opt_core.py
+
+That command still creates the normal daily cache files, but now also creates
+one upload bundle per calendar month in the same cache directory, for example:
+
+    opt_v3_202607.parquet
+    opt_v3_202608.parquet
+    opt_v3_202609.parquet
+
+Upload the monthly files to the web app instead of selecting 20+ daily files
+for every month. The app reads the actual trade dates inside each monthly file,
+so the date-range selector still works at daily resolution. Uploaded files are
+parsed only once per browser session. If files overlap, the app uses exactly
+one source per day with this precedence: daily parquet, monthly parquet, raw
+CSV. No market-data file needs to be committed to GitHub.
+
 ## The cache, and running without the raw files
 
 Options are a rounding error of each daily file — roughly 0.3% of rows, a few
 thousand out of 12 million. So the loader filters raw bytes for `;O_` and
 `;TM_O_` before pandas sees anything, then stores the parsed result as one
 parquet per trade date. A 123-day cold build takes about a minute; six months
-of parsed option trades is under 6 MB.
+of parsed option trades is under 6 MB. After the daily caches are ready, the
+CLI also packs them into monthly parquet bundles for convenient browser upload.
+The daily files remain the canonical local cache.
 
 Because loading is **cache-first**, a machine that can reach the cache folder
 needs no raw CSVs at all — put the cache on a share and everyone reads from it:
 
-    python viop_opt_core.py                 # warm the cache from local raw files
-    python viop_opt_core.py --force         # re-parse dates already cached
+    python viop_opt_core.py                 # build daily + monthly caches
+    python viop_opt_core.py --force         # rebuild daily + monthly caches
+    python viop_opt_core.py --daily-only    # skip monthly upload bundles
     python viop_opt_core.py --cache-dir X --data-dir Y
 
 Bumping `CACHE_VERSION` in `viop_opt_core.py` invalidates every parquet, which

@@ -2,9 +2,9 @@
 
     streamlit run viop_opt_app.py
 
-Cumulative version of the single-day butterfly in matriks.py: it reads every
-ViopDefter file in a date range out of D:\\vscode\\bistzamansatis (options
-only, TM_ contracts included), and answers three questions:
+Cumulative version of the single-day butterfly in matriks.py. Data can come
+from browser-uploaded ViopDefter/cache files or from server-side folders. It
+keeps options only (TM_ contracts included) and answers three questions:
 
   * Strike Ladder    - where volume and net position landed, by strike
   * Participant Flow - who bought, who sold, and what they are left holding
@@ -32,12 +32,7 @@ st.set_page_config(page_title="VIOP Options Flow", layout="wide",
 # ------------------------------------------------------------------ config
 
 def configured(key: str, fallback) -> str:
-    """A path from .streamlit/secrets.toml if there is one, else the default.
-
-    Lets a deployment be pointed at its data without editing code or setting
-    environment variables; viop_opt_core already honours VIOP_DATA_DIR and
-    VIOP_CACHE_DIR, and this simply layers secrets on top.
-    """
+    """A path from .streamlit/secrets.toml if there is one, else the default."""
     try:
         return str(st.secrets[key])
     except Exception:          # no secrets file, or no such key
@@ -48,21 +43,14 @@ def configured(key: str, fallback) -> str:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def cached_files(data_dir: str, cache_dir: str) -> pd.DataFrame:
-    """What is loadable right now.
-
-    The TTL matters: this is two directory listings, and without it an empty
-    or unreachable folder gets cached for the life of the process, so a daily
-    drop or a refilled cache could never appear without a restart -- and the
-    page would keep insisting there is no data while the files sit there.
-    """
+    """What is loadable from local/server-side folders right now."""
     return C.available_dates(data_dir, cache_dir)
 
 
 @st.cache_data(show_spinner=False)
 def cached_load(data_dir: str, cache_dir: str, start, end,
                 token: int, fingerprint: tuple = ()) -> pd.DataFrame:
-    """`fingerprint` is part of the cache key, not used in the body: when the
-    set of loadable dates changes, the loaded frame must be recomputed."""
+    """Load a local/server-side date range using the normal cache-first path."""
     bar = st.progress(0.0, text="Loading option trades...")
 
     def prog(i, n, d):
@@ -75,67 +63,194 @@ def cached_load(data_dir: str, cache_dir: str, start, end,
     return df
 
 
+def session_uploaded_file(uploaded) -> pd.DataFrame:
+    """Parse one upload once per browser session, not in Streamlit's global cache.
+
+    Uploaded trade data is member-identified, so keeping this cache in
+    ``st.session_state`` avoids sharing uploaded DataFrames across user
+    sessions while still preventing expensive raw-CSV reparsing on every
+    chart interaction.
+    """
+    file_id = getattr(uploaded, "file_id", None)
+    key = f"{file_id or 'no-id'}|{uploaded.name}|{uploaded.size}"
+    store = st.session_state.setdefault("_uploaded_option_frames", {})
+    if key not in store:
+        store[key] = C.load_uploaded_bytes(uploaded.name, uploaded.getvalue())
+    return store[key]
+
+
+def uploaded_days(files):
+    """Load uploads and resolve overlaps to exactly one source per trade date.
+
+    A monthly parquet may contain many dates. If uploads overlap, the order of
+    preference is daily parquet > monthly parquet > raw daily CSV. This avoids
+    double counting while still allowing a daily file to override one day of a
+    monthly bundle.
+    """
+    chosen = {}
+    rejected = []
+    errors = []
+    valid = []
+    for f in files:
+        info = C.uploaded_file_info(f.name)
+        if info is None:
+            rejected.append(f.name)
+        else:
+            valid.append((f, info[0]))
+
+    bar = st.progress(0.0, text="Loading uploaded option data...")
+    for i, (f, kind) in enumerate(valid, start=1):
+        bar.progress((i - 1) / max(len(valid), 1), text=f"Loading {f.name}...")
+        try:
+            frame = session_uploaded_file(f)
+        except Exception as exc:
+            errors.append(f"{f.name}: {exc}")
+            continue
+        if frame is None or frame.empty:
+            continue
+
+        frame = frame.copy()
+        frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
+        priority = C.upload_priority(kind)
+        for day, part in frame.groupby("date", sort=True):
+            day = pd.Timestamp(day).normalize()
+            old = chosen.get(day)
+            if old is None or priority > old[0]:
+                chosen[day] = (priority, kind, f.name,
+                               part.reset_index(drop=True))
+
+    bar.progress(1.0, text="Loading uploaded option data... done")
+    bar.empty()
+    return chosen, rejected, errors
+
+
 # ------------------------------------------------------------------ sidebar
 
 st.sidebar.header("Data")
-cache_dir = st.sidebar.text_input("Cache folder (shared)",
-                                  value=configured("cache_dir", C.CACHE_DIR))
-data_dir = st.sidebar.text_input("Raw ViopDefter folder",
-                                 value=configured("data_dir", C.DATA_DIR),
-                                 help="Only needed for dates that are not "
-                                      "cached yet. Cached dates load without "
-                                      "it.")
-files = cached_files(data_dir, cache_dir)
+source_mode = st.sidebar.radio(
+    "Source",
+    ["Upload files", "Local folders"],
+    horizontal=True,
+    help="Upload files works on Streamlit Cloud. Local folders are paths on "
+         "the machine that is actually running Streamlit.")
 
-if files.empty:
-    st.sidebar.error("Nothing loadable from either folder.")
-    st.title("VIOP Options Flow")
-    st.warning(f"No cached parquet in `{cache_dir}` and no "
-               f"ViopDefterYYYYMMDD.csv in `{data_dir}`.")
-    st.markdown(
-        "Point it at your data in any one of three ways:\n\n"
-        "1. **Edit either folder in the sidebar** — takes effect immediately.\n"
-        "2. **Create `.streamlit/secrets.toml`** beside the app with "
-        "`cache_dir = '...'` and `data_dir = '...'`.\n"
-        "3. **Set `VIOP_CACHE_DIR` / `VIOP_DATA_DIR`** in the environment.\n\n"
-        "A fresh clone shows the repo-relative defaults `opt_cache` and "
-        "`data`, because `secrets.toml` is gitignored on purpose — real paths "
-        "are never published. If the cache folder is reachable but empty, "
-        "warm it from a machine that has the raw files with "
-        "`python viop_opt_core.py`.")
-    st.stop()
+if source_mode == "Upload files":
+    uploads = st.sidebar.file_uploader(
+        "Monthly cache, daily cache, or ViopDefter CSV",
+        type=["csv", "parquet"],
+        accept_multiple_files=True,
+        help="Best for cloud use: upload opt_v*_YYYYMM.parquet monthly bundles. "
+             "Daily opt_v*_YYYYMMDD.parquet caches and raw "
+             "ViopDefterYYYYMMDD.csv files also work.")
 
-n_cached = int(files["cached"].sum())
-n_raw_only = int((~files["cached"] & files["path"].notna()).sum())
-st.sidebar.caption(
-    f"{len(files)} dates loadable — {n_cached} from cache"
-    + (f", {n_raw_only} still to parse" if n_raw_only else ""))
+    if not uploads:
+        st.title("VIOP Options Flow")
+        st.info(
+            "Upload one or more monthly `opt_vN_YYYYMM.parquet` files from "
+            "the sidebar. Daily cache files and raw ViopDefter CSVs are also "
+            "accepted. Monthly files are the recommended cloud workflow: one "
+            "small upload contains every option trade date in that month.")
+        st.stop()
 
-all_dates = [d.date() for d in files["date"]]
-if len(all_dates) > 1:
-    start_d, end_d = st.sidebar.select_slider(
-        "Trade dates (cumulative)", options=all_dates,
-        value=(all_dates[0], all_dates[-1]))
+    chosen, rejected, errors = uploaded_days(uploads)
+    if rejected:
+        st.sidebar.warning(
+            "Ignored files with unsupported names: " + ", ".join(rejected))
+    if errors:
+        st.sidebar.error("Some files could not be loaded.")
+        with st.sidebar.expander("Upload errors"):
+            for msg in errors:
+                st.write(msg)
+    if not chosen:
+        st.title("VIOP Options Flow")
+        st.error(
+            "No option trades were loaded. Recognized names are "
+            "`opt_vN_YYYYMM.parquet`, `opt_vN_YYYYMMDD.parquet`, and "
+            "`ViopDefterYYYYMMDD.csv`.")
+        st.stop()
+
+    all_dates = [d.date() for d in sorted(chosen)]
+    if len(all_dates) > 1:
+        start_d, end_d = st.sidebar.select_slider(
+            "Trade dates (cumulative)", options=all_dates,
+            value=(all_dates[0], all_dates[-1]))
+    else:
+        start_d = end_d = all_dates[0]
+        st.sidebar.caption(f"Only one trade date: {start_d}")
+
+    theme = st.sidebar.selectbox("Theme", list(V.PALETTES))
+    P = V.PALETTES[theme]
+
+    selected_days = [
+        d for d in sorted(chosen)
+        if pd.Timestamp(start_d) <= d <= pd.Timestamp(end_d)
+    ]
+    parts = [chosen[d][3] for d in selected_days]
+    df_all = pd.concat(parts, ignore_index=True)
+
+    used_files = {chosen[d][2] for d in selected_days}
+    monthly_files = {
+        chosen[d][2] for d in selected_days
+        if chosen[d][1] == "parquet_monthly"
+    }
+    label = (f"{len(selected_days)} trade day(s) from {len(used_files)} "
+             f"uploaded file(s)")
+    if monthly_files:
+        label += f" · {len(monthly_files)} monthly bundle(s)"
+    st.sidebar.caption(label + f" · {len(df_all):,} option trades")
+
 else:
-    start_d = end_d = all_dates[0]
-    st.sidebar.caption(f"Only one file: {start_d}")
+    cache_dir = st.sidebar.text_input(
+        "Cache folder (shared)", value=configured("cache_dir", C.CACHE_DIR))
+    data_dir = st.sidebar.text_input(
+        "Raw ViopDefter folder", value=configured("data_dir", C.DATA_DIR),
+        help="Only needed for dates that are not cached yet. Cached dates "
+             "load without it.")
+    files = cached_files(data_dir, cache_dir)
 
-st.session_state.setdefault("cache_token", 0)
-c1, c2 = st.sidebar.columns(2)
-if c1.button("Reload", width="stretch",
-             help="Re-scan both folders and parse any date not yet cached"):
-    st.session_state["cache_token"] += 1
-    cached_files.clear()
-    cached_load.clear()
-theme = c2.selectbox("Theme", list(V.PALETTES), label_visibility="collapsed")
-P = V.PALETTES[theme]
+    if files.empty:
+        st.sidebar.error("Nothing loadable from either folder.")
+        st.title("VIOP Options Flow")
+        st.warning(f"No cached parquet in `{cache_dir}` and no "
+                   f"ViopDefterYYYYMMDD.csv in `{data_dir}`.")
+        st.markdown(
+            "Switch **Source** to **Upload files**, or point this server at "
+            "folders it can actually reach. A browser user's own `D:` drive "
+            "is never visible to a remotely hosted Streamlit process.")
+        st.stop()
 
-df_all = cached_load(data_dir, cache_dir, pd.Timestamp(start_d),
-                     pd.Timestamp(end_d), st.session_state["cache_token"],
-                     (len(files), n_cached))
-if df_all.empty:
-    st.warning("No option trades in the selected range.")
-    st.stop()
+    n_cached = int(files["cached"].sum())
+    n_raw_only = int((~files["cached"] & files["path"].notna()).sum())
+    st.sidebar.caption(
+        f"{len(files)} dates loadable — {n_cached} from cache"
+        + (f", {n_raw_only} still to parse" if n_raw_only else ""))
+
+    all_dates = [d.date() for d in files["date"]]
+    if len(all_dates) > 1:
+        start_d, end_d = st.sidebar.select_slider(
+            "Trade dates (cumulative)", options=all_dates,
+            value=(all_dates[0], all_dates[-1]))
+    else:
+        start_d = end_d = all_dates[0]
+        st.sidebar.caption(f"Only one file: {start_d}")
+
+    st.session_state.setdefault("cache_token", 0)
+    c1, c2 = st.sidebar.columns(2)
+    if c1.button("Reload", width="stretch",
+                 help="Re-scan both folders and parse any date not yet cached"):
+        st.session_state["cache_token"] += 1
+        cached_files.clear()
+        cached_load.clear()
+    theme = c2.selectbox("Theme", list(V.PALETTES),
+                         label_visibility="collapsed")
+    P = V.PALETTES[theme]
+
+    df_all = cached_load(
+        data_dir, cache_dir, pd.Timestamp(start_d), pd.Timestamp(end_d),
+        st.session_state["cache_token"], (len(files), n_cached))
+    if df_all.empty:
+        st.warning("No option trades in the selected range.")
+        st.stop()
 
 st.sidebar.markdown("---")
 st.sidebar.header("Scope")

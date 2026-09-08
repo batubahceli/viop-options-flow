@@ -2,7 +2,8 @@
 
 Reads BIST VIOP time & sales files (``ViopDefterYYYYMMDD.csv``), keeps the
 option trades only (``O_`` / ``TM_O_``), parses the contract code and caches
-the result as one parquet file per trade date.
+the result as one parquet file per trade date.  It also packs those daily
+caches into one upload-friendly parquet per calendar month.
 
 Only ~0.3% of the rows in a daily file are options (36k out of 12M across the
 15 files in bistzamansatis), so the loader pre-filters raw bytes line by line
@@ -31,6 +32,9 @@ CACHE_VERSION = 3  # bump to invalidate every cached parquet
 
 FILE_RE = re.compile(r"^ViopDefter(?P<d>\d{8})\.csv$", re.IGNORECASE)
 CACHE_RE = re.compile(r"^opt_v(?P<v>\d+)_(?P<d>\d{8})\.parquet$", re.IGNORECASE)
+MONTH_CACHE_RE = re.compile(
+    r"^opt_v(?P<v>\d+)_(?P<m>\d{6})\.parquet$", re.IGNORECASE
+)
 
 # Contract codes, e.g.
 #   O_XU030E1026P17000.00      standard, MMYY expiry -> month-end
@@ -163,6 +167,116 @@ def read_raw_options(path: Path) -> pd.DataFrame:
     )
 
 
+def read_raw_options_bytes(data: bytes) -> pd.DataFrame:
+    """Option rows from an uploaded ``ViopDefter`` CSV held in memory.
+
+    Streamlit's browser uploader gives the server the file bytes rather than a
+    filesystem path.  We keep the same fast pre-filtering idea used by
+    :func:`read_raw_options`: only lines containing option symbols are retained
+    before pandas parses the CSV.
+    """
+    fh = io.BytesIO(data)
+    header = fh.readline()
+    if not header:
+        return pd.DataFrame(columns=RAW_COLS)
+    if not header.endswith((b"\n", b"\r")):
+        header += b"\n"
+
+    kept = []
+    for line in fh:
+        if b";O_" in line or b";TM_O_" in line:
+            kept.append(line)
+    if not kept:
+        return pd.DataFrame(columns=RAW_COLS)
+
+    buf = io.BytesIO(header + b"".join(kept))
+    return pd.read_csv(
+        buf, sep=";", engine="c", low_memory=False,
+        usecols=lambda c: c in RAW_COLS,
+        dtype={"SAAT": "string", "SEMBOL": "string",
+               "ALAN": "string", "SATAN": "string"},
+    )
+
+
+def uploaded_file_info(name: str) -> tuple[str, pd.Timestamp] | None:
+    """Return ``(kind, period_start)`` for a recognized browser upload.
+
+    Accepted names:
+
+    * ``ViopDefterYYYYMMDD.csv`` - one raw trade date
+    * ``opt_vN_YYYYMMDD.parquet`` - one cached trade date
+    * ``opt_vN_YYYYMM.parquet`` - one monthly cache bundle
+
+    ``period_start`` is the trade date for daily files and the first calendar
+    day of the month for monthly bundles.
+    """
+    base = Path(name).name
+    m = FILE_RE.match(base)
+    if m:
+        return "csv_daily", pd.Timestamp(m.group("d"))
+    m = CACHE_RE.match(base)
+    if m:
+        return "parquet_daily", pd.Timestamp(m.group("d"))
+    m = MONTH_CACHE_RE.match(base)
+    if m:
+        return "parquet_monthly", pd.Timestamp(m.group("m") + "01")
+    return None
+
+
+def upload_priority(kind: str) -> int:
+    """Preference when two uploads cover the same trade date."""
+    return {
+        "csv_daily": 1,
+        "parquet_monthly": 2,
+        "parquet_daily": 3,
+    }.get(kind, 0)
+
+
+def load_uploaded_bytes(name: str, data: bytes) -> pd.DataFrame:
+    """Load one file received through a browser upload.
+
+    Raw CSVs are filtered and parsed with the normal contract parser. Parquet
+    files must already have the option-cache schema. Daily parquet filenames
+    are checked against their single date; monthly filenames are checked so
+    that every embedded trade date belongs to the encoded YYYYMM month.
+    """
+    info = uploaded_file_info(name)
+    if info is None:
+        raise ValueError(
+            "Unsupported filename. Use ViopDefterYYYYMMDD.csv, "
+            "opt_vN_YYYYMMDD.parquet, or opt_vN_YYYYMM.parquet")
+    kind, period_start = info
+
+    if kind == "csv_daily":
+        return parse_options(read_raw_options_bytes(data), period_start)
+
+    frame = pd.read_parquet(io.BytesIO(data))
+    missing = [c for c in OUT_COLS if c not in frame.columns]
+    if missing:
+        raise ValueError(
+            f"{Path(name).name} is not a VIOP option cache; missing columns: "
+            + ", ".join(missing))
+    frame = frame[OUT_COLS].copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+    if frame["date"].isna().any():
+        raise ValueError(f"{Path(name).name} contains invalid trade dates")
+
+    dates = frame["date"].drop_duplicates()
+    if kind == "parquet_daily":
+        if len(dates) and not dates.eq(period_start.normalize()).all():
+            raise ValueError(
+                f"{Path(name).name} says {period_start.date()} in its filename "
+                "but contains a different trade date")
+    else:
+        expected = period_start.strftime("%Y%m")
+        present = dates.dt.strftime("%Y%m")
+        if len(present) and not present.eq(expected).all():
+            raise ValueError(
+                f"{Path(name).name} says {expected} in its filename but "
+                "contains trade dates from another month")
+    return frame.reset_index(drop=True)
+
+
 # ------------------------------------------------------------------ parsing
 
 def parse_options(raw: pd.DataFrame, trade_date) -> pd.DataFrame:
@@ -230,6 +344,12 @@ def cache_path(trade_date, cache_dir: Path | str = CACHE_DIR) -> Path:
     return Path(cache_dir) / f"opt_v{CACHE_VERSION}_{d}.parquet"
 
 
+def monthly_cache_path(month, cache_dir: Path | str = CACHE_DIR) -> Path:
+    """Path of an upload-friendly monthly parquet bundle."""
+    m = pd.Timestamp(month).strftime("%Y%m")
+    return Path(cache_dir) / f"opt_v{CACHE_VERSION}_{m}.parquet"
+
+
 def ensure_cached(trade_date, src: Path | None = None,
                   cache_dir: Path | str = CACHE_DIR,
                   force: bool = False) -> Path:
@@ -286,18 +406,77 @@ def load_range(start, end, data_dir: Path | str = DATA_DIR,
 def build_cache(data_dir: Path | str = DATA_DIR,
                 cache_dir: Path | str = CACHE_DIR,
                 force: bool = False, log=print) -> pd.DataFrame:
-    """Warm the cache for every raw file present. Use this to fill the NAS."""
+    """Warm the daily cache for every raw file present."""
     files = discover_files(data_dir)
     rows = []
     for row in files.itertuples(index=False):
         dst = cache_path(row.date, cache_dir)
         fresh = force or not dst.exists()
         ensure_cached(row.date, row.path, cache_dir, force)
-        n = len(pd.read_parquet(dst))
+        n = len(pd.read_parquet(dst, columns=["date"]))
         rows.append({"date": row.date, "trades": n,
                      "action": "built" if fresh else "kept"})
         log(f"  {row.date.date()}  {n:>7,} option trades  "
             f"({'built' if fresh else 'already cached'})")
+    return pd.DataFrame(rows)
+
+
+def build_monthly_cache(cache_dir: Path | str = CACHE_DIR,
+                        force: bool = False, log=print) -> pd.DataFrame:
+    """Pack daily option caches into one parquet per calendar month.
+
+    Daily caches remain the canonical local cache because they can be updated
+    independently. Monthly bundles are convenience files for browser upload.
+    A monthly file is rebuilt only when it is missing, ``force`` is true, or
+    one of its daily caches is newer than the existing bundle.
+    """
+    daily = discover_cache(cache_dir)
+    if daily.empty:
+        return pd.DataFrame(columns=["month", "days", "trades", "path", "action"])
+
+    daily = daily.copy()
+    daily["month"] = daily["date"].dt.to_period("M")
+    rows = []
+    for month, grp in daily.groupby("month", sort=True):
+        dst = monthly_cache_path(month.start_time, cache_dir)
+        newest_daily = max(Path(p).stat().st_mtime for p in grp["cache"])
+        stale = force or not dst.exists() or dst.stat().st_mtime < newest_daily
+        if not stale:
+            try:
+                packed_dates = pd.to_datetime(
+                    pd.read_parquet(dst, columns=["date"])["date"]
+                ).dt.normalize().drop_duplicates()
+                expected_dates = set(pd.to_datetime(grp["date"]).dt.normalize())
+                if set(packed_dates) != expected_dates:
+                    stale = True
+            except (OSError, ValueError, KeyError):
+                stale = True
+
+        if stale:
+            parts = [pd.read_parquet(p) for p in grp["cache"]]
+            frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
+                columns=OUT_COLS)
+            if not frame.empty:
+                frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
+                frame = frame.sort_values(["date", "time"], kind="stable")
+            frame = frame[OUT_COLS]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            frame.to_parquet(dst, index=False)
+            action = "built"
+            n = len(frame)
+        else:
+            action = "kept"
+            n = len(pd.read_parquet(dst, columns=["date"]))
+
+        rows.append({
+            "month": month.start_time,
+            "days": int(grp["date"].nunique()),
+            "trades": n,
+            "path": dst,
+            "action": action,
+        })
+        log(f"  {month}  {len(grp):>2} day(s)  {n:>8,} option trades  "
+            f"({action})  -> {dst.name}")
     return pd.DataFrame(rows)
 
 
@@ -501,21 +680,33 @@ def expiry_options(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------- cli
 
 def _main(argv=None):
-    """Warm the shared cache: python viop_opt_core.py [--force]"""
+    """Build daily caches and upload-friendly monthly bundles."""
     import argparse
     ap = argparse.ArgumentParser(description=_main.__doc__)
     ap.add_argument("--data-dir", default=str(DATA_DIR))
     ap.add_argument("--cache-dir", default=str(CACHE_DIR))
     ap.add_argument("--force", action="store_true",
-                    help="re-parse dates that are already cached")
+                    help="re-parse daily caches and rebuild monthly bundles")
+    ap.add_argument("--daily-only", action="store_true",
+                    help="skip creation of monthly upload bundles")
     a = ap.parse_args(argv)
 
     print(f"raw   : {a.data_dir}")
     print(f"cache : {a.cache_dir}")
+    print("\nDaily cache:")
     done = build_cache(a.data_dir, a.cache_dir, a.force)
     avail = available_dates(a.data_dir, a.cache_dir)
-    print(f"\n{len(done)} file(s) processed · {len(avail)} date(s) now "
-          f"loadable · {int(avail['cached'].sum())} in cache")
+    print(f"\n{len(done)} raw file(s) processed · {len(avail)} date(s) loadable · "
+          f"{int(avail['cached'].sum())} daily cache file(s)")
+
+    if not a.daily_only:
+        print("\nMonthly upload bundles:")
+        monthly = build_monthly_cache(a.cache_dir, a.force)
+        if monthly.empty:
+            print("  no daily cache files available to pack")
+        else:
+            built = int((monthly["action"] == "built").sum())
+            print(f"\n{len(monthly)} month(s) available · {built} rebuilt")
     return 0
 
 
